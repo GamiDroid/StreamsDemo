@@ -1,10 +1,9 @@
-﻿using System.IO;
-using System;
+﻿using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using System.Buffers;
+
 
 namespace Quartz.Core;
 
@@ -28,14 +27,14 @@ public class QuartzClient(string ipAddress, int port) : IDisposable
         _keepAliveMonitorTask = KeepAliveMonitor(_cancellationTokenSource.Token);
     }
 
-    ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
     private async Task StartReceivingAsync(CancellationToken cancellationToken)
     {
         var stream = _tcpClient.GetStream();
+        using var incompleteMessageBuffer = new MemoryStream();
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            var buffer = _arrayPool.Rent(4096);
+            var buffer = ArrayPool<byte>.Shared.Rent(4096);
             try
             {
                 var bytesRead = await stream.ReadAsync(buffer, cancellationToken);
@@ -45,39 +44,11 @@ public class QuartzClient(string ipAddress, int port) : IDisposable
                     break; // Connection closed
                 }
 
-                if (bytesRead == 3)
-                {
-                    Console.WriteLine("KeepAlive received");
-                    continue;
-                }
+                // Append the new data to the incomplete message buffer
+                incompleteMessageBuffer.Write(buffer, 0, bytesRead);
 
-                // Message is structured as: 0x01 + header + 0x02 + body + 0x03
-                // Find the start and end of the message
-                int headerStart = Array.IndexOf(buffer, (byte)0x01);
-                if (headerStart == -1)
-                {
-                    Console.WriteLine("Invalid message format");
-                }
-
-                if (headerStart != 0)
-                    Console.WriteLine("WARN Header start not at beginning of stream");
-
-                int headerEnd = Array.IndexOf(buffer, (byte)0x02, headerStart + 1, bytesRead);
-                int bodyStart = headerEnd + 1;
-                int bodyEnd = Array.IndexOf(buffer, (byte)0x03, bodyStart, bytesRead - bodyStart);
-                if (headerEnd == -1 || bodyEnd == -1)
-                {
-                    Console.WriteLine("Invalid message format");
-                    continue;
-                }
-
-                // Extract header and body
-                var header = Encoding.UTF8.GetString(buffer, headerStart + 1, headerEnd - headerStart - 1);
-                var body = Encoding.UTF8.GetString(buffer, bodyStart, bodyEnd - bodyStart);
-
-                // Process the received data
-                var message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                Console.WriteLine($"Received: {message}");
+                // Process messages from the buffer
+                ProcessMessages(incompleteMessageBuffer);
             }
             catch (Exception ex)
             {
@@ -85,12 +56,47 @@ public class QuartzClient(string ipAddress, int port) : IDisposable
             }
             finally
             {
-                // Return the buffer to the pool
-                _arrayPool.Return(buffer);
+                ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 
         Console.WriteLine("Stopped receiving data");
+    }
+
+    private static void ProcessMessages(MemoryStream bufferStream)
+    {
+        bufferStream.Position = 0; // Reset position to start reading
+        var buffer = bufferStream.ToArray();
+        int start = 0;
+
+        while (true)
+        {
+            // Find the start and end of a message
+            int headerStart = Array.IndexOf(buffer, (byte)0x01, start);
+            if (headerStart == -1) break;
+
+            int headerEnd = Array.IndexOf(buffer, (byte)0x02, headerStart + 1);
+            if (headerEnd == -1) break;
+
+            int bodyEnd = Array.IndexOf(buffer, (byte)0x03, headerEnd + 1);
+            if (bodyEnd == -1) break;
+
+            // Extract and process the message
+            var header = JsonSerializer.Deserialize<QuartzMessageHeader>(
+                new ReadOnlySpan<byte>(buffer, headerStart + 1, headerEnd - headerStart - 1));
+
+            var body = Encoding.UTF8.GetString(buffer, headerEnd + 1, bodyEnd - headerEnd - 1);
+
+            Console.WriteLine($"Header: {header}, Body: {body}");
+
+            // Move the start pointer past the processed message
+            start = bodyEnd + 1;
+        }
+
+        // Keep any remaining data in the buffer
+        var remainingData = buffer.AsSpan(start).ToArray();
+        bufferStream.SetLength(0); // Clear the buffer
+        bufferStream.Write(remainingData, 0, remainingData.Length);
     }
 
     private async Task KeepAliveMonitor(CancellationToken cancellationToken)
@@ -191,6 +197,6 @@ public class QuartzClient(string ipAddress, int port) : IDisposable
         // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
-    } 
+    }
     #endregion
 }
