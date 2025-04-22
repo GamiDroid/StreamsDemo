@@ -44,6 +44,11 @@ public class QuartzClient(string ipAddress, int port) : IDisposable
                     break; // Connection closed
                 }
 
+                if (bytesRead == 3)
+                {
+                    continue; // ignore keep-alive message
+                }
+
                 // Append the new data to the incomplete message buffer
                 incompleteMessageBuffer.Write(buffer, 0, bytesRead);
 
